@@ -1,74 +1,104 @@
 # API
 
-## GET /projects
-
-プロジェクト一覧を返します。
-
-レスポンス例:
-```json
-["project_a", "project_b"]
-```
+Swagger の定義そのものではなく、**使いどころベース**で整理しています。
 
 ## GET /templates
 
-プロジェクト配下のクラス一覧を返します。
+役割:
+- プロジェクトごとのクラス一覧とテンプレ数を取得
 
-レスポンス例:
-```json
-[
-  {
-    "name": "project_a",
-    "classes": [
-      {"class_name": "図形1", "count": 3},
-      {"class_name": "図形2", "count": 1}
-    ]
-  }
-]
-```
+UI対応:
+- プロジェクト選択やクラス内訳表示の初期ロード
+
+処理負荷:
+- 軽い（ファイル一覧のスキャン結果を返す）
+
+タイミング:
+- 画面初期表示時
+
+## GET /projects
+
+役割:
+- プロジェクト一覧の取得
+
+UI対応:
+- プロジェクト選択プルダウンの生成
+
+処理負荷:
+- 軽い
+
+タイミング:
+- 画面初期表示時
 
 ## POST /image/upload
 
-画像をアップロードして `image_id` と画像サイズを返します。
+役割:
+- 画像アップロードと `image_id` 発行
 
-リクエスト:
-- `multipart/form-data`
-- `file` に jpg/png
+UI対応:
+- 画像を読み込んだタイミング
 
-レスポンス例:
-```json
-{"image_id": "xxxx.jpeg", "width": 2048, "height": 1024}
-```
+処理負荷:
+- 中（画像保存・サイズ取得）
+
+タイミング:
+- 画像アップロード時
 
 ## POST /detect/point
 
-クリック点周辺ROIでテンプレ照合します。
+役割:
+- クリック点周辺ROIのテンプレ照合 → フィルタ → NMS → クラス代表 → TopK
+- Template OFF時は輪郭抽出で候補生成
 
-リクエスト例:
-```json
-{
-  "image_id": "xxxx.jpeg",
-  "project": "project_a",
-  "x": 100,
-  "y": 200,
-  "roi_size": 200,
-  "scale_min": 0.5,
-  "scale_max": 1.5,
-  "scale_steps": 12,
-  "topk": 3
-}
-```
+UI対応:
+- クリック検出、候補リスト更新、bbox表示
 
-レスポンス例:
-```json
-{
-  "results": [
-    {
-      "class_name": "図形1",
-      "score": 0.93,
-      "bbox": {"x": 80, "y": 150, "w": 64, "h": 64},
-      "template_name": "0.jpeg",
-      "scale": 1.1
-    }
-  ]
-}
-```
+処理負荷:
+- 中（テンプレ数とスケール数に依存）
+
+タイミング:
+- 画像クリック時
+
+## POST /detect/full
+
+役割:
+- 画像全体をタイル（1024x1024）でテンプレ照合し候補生成
+
+UI対応:
+- 一括検出（現状 UI 未対応）
+
+処理負荷:
+- 重い（タイル数とテンプレ数に依存）
+
+タイミング:
+- バッチ検出や検証用途
+
+## POST /segment/candidate
+
+役割:
+- 選択候補のROIに対して SAM でセグメント生成
+- 失敗時はフォールバックで輪郭抽出
+
+UI対応:
+- 「Seg生成（SAM）」ボタン
+
+処理負荷:
+- 重い（SAM推論）
+
+タイミング:
+- 必要時のみ（オンデマンド）
+
+## POST /export/yolo
+
+役割:
+- annotation を YOLO / YOLO-seg 形式で 1画像=1txt 出力
+- `data/runs/<project>/classes.json` に class_id を保存
+
+UI対応:
+- 「YOLOエクスポート」ボタン
+
+処理負荷:
+- 軽い
+
+タイミング:
+- アノテ確定後の出力時

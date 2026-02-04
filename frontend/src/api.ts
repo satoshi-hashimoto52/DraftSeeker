@@ -25,6 +25,8 @@ export type Candidate = {
   template: string;
   scale: number;
   segPolygon?: { x: number; y: number }[];
+  segMethod?: "sam" | "fallback";
+  source?: "template" | "manual";
 };
 
 export type Annotation = {
@@ -34,6 +36,8 @@ export type Annotation = {
   source: "template" | "manual" | "sam";
   created_at: string;
   segPolygon?: { x: number; y: number }[];
+  originalSegPolygon?: { x: number; y: number }[];
+  segMethod?: "sam" | "fallback";
 };
 
 export function toCandidates(res: DetectPointResponse): Candidate[] {
@@ -139,6 +143,20 @@ export async function fetchProjects(): Promise<string[]> {
     throw new Error(text || "Projects fetch failed");
   }
   return (await res.json()) as string[];
+}
+
+export type ProjectTemplates = {
+  name: string;
+  classes: { class_name: string; count: number }[];
+};
+
+export async function fetchTemplates(): Promise<ProjectTemplates[]> {
+  const res = await fetch(`${API_BASE}/templates`);
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || "Templates fetch failed");
+  }
+  return (await res.json()) as ProjectTemplates[];
 }
 
 export async function detectPoint(params: {

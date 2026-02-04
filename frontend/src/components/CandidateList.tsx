@@ -45,6 +45,19 @@ export default function CandidateList({
               }}
             />
             {idx + 1}. {c.class_name}
+            {c.source === "manual" && (
+              <span
+                style={{
+                  fontSize: 10,
+                  padding: "2px 6px",
+                  borderRadius: 10,
+                  background: "#607d8b",
+                  color: "#fff",
+                }}
+              >
+                MANUAL
+              </span>
+            )}
           </div>
           <div style={{ fontSize: 12, color: "#444" }}>score: {c.score.toFixed(4)}</div>
           <div style={{ fontSize: 12, color: "#666" }}>template: {c.template}</div>

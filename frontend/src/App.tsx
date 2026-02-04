@@ -6,6 +6,7 @@ import {
   detectPoint,
   exportYolo,
   fetchProjects,
+  fetchTemplates,
   segmentCandidate,
   toCandidates,
   uploadImage,
@@ -13,6 +14,7 @@ import {
 import ImageCanvas, { ImageCanvasHandle } from "./components/ImageCanvas";
 import CandidateList from "./components/CandidateList";
 import { normalizeToHex } from "./utils/color";
+import { clampToImage, simplifyPolygon } from "./utils/polygon";
 
 const DEFAULT_ROI_SIZE = 200;
 const DEFAULT_TOPK = 3;
@@ -25,6 +27,7 @@ export default function App() {
   const [imageId, setImageId] = useState<string | null>(null);
   const [projects, setProjects] = useState<string[]>([]);
   const [project, setProject] = useState<string>("");
+  const [classOptions, setClassOptions] = useState<string[]>([]);
   const [roiSize, setRoiSize] = useState<number>(DEFAULT_ROI_SIZE);
   const [topk, setTopk] = useState<number>(DEFAULT_TOPK);
   const [scaleMin, setScaleMin] = useState<number>(DEFAULT_SCALE_MIN);
@@ -43,11 +46,70 @@ export default function App() {
   const canvasRef = useRef<ImageCanvasHandle | null>(null);
   const [lastClick, setLastClick] = useState<{ x: number; y: number } | null>(null);
   const [exportPreview, setExportPreview] = useState<string | null>(null);
+  const [segEditMode, setSegEditMode] = useState<boolean>(false);
+  const [showSegVertices, setShowSegVertices] = useState<boolean>(true);
+  const [selectedVertexIndex, setSelectedVertexIndex] = useState<number | null>(null);
+  const [segUndoStack, setSegUndoStack] = useState<{ x: number; y: number }[][]>([]);
+  const [segSimplifyEps, setSegSimplifyEps] = useState<number>(2);
+  const [imageSize, setImageSize] = useState<{ w: number; h: number } | null>(null);
+  const [isCreatingManualBBox, setIsCreatingManualBBox] = useState<boolean>(false);
 
   const selectedCandidate = useMemo(() => {
     if (!selectedCandidateId) return null;
     return candidates.find((c) => c.id === selectedCandidateId) || null;
   }, [candidates, selectedCandidateId]);
+
+  const isManualSelected = useMemo(
+    () => selectedCandidate?.source === "manual",
+    [selectedCandidate]
+  );
+  const manualClassMissing = useMemo(
+    () => isManualSelected && !selectedCandidate?.class_name,
+    [isManualSelected, selectedCandidate]
+  );
+
+  const selectedAnnotation = useMemo(() => {
+    if (!selectedAnnotationId) return null;
+    return annotations.find((a) => a.id === selectedAnnotationId) || null;
+  }, [annotations, selectedAnnotationId]);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (!selectedCandidate || segEditMode) return;
+      const target = event.target as HTMLElement | null;
+      const tag = target?.tagName?.toLowerCase();
+      if (tag === "input" || tag === "textarea" || tag === "select") return;
+
+      let dx = 0;
+      let dy = 0;
+      const step = event.shiftKey ? 10 : 1;
+      if (event.key === "ArrowLeft") dx = -step;
+      if (event.key === "ArrowRight") dx = step;
+      if (event.key === "ArrowUp") dy = -step;
+      if (event.key === "ArrowDown") dy = step;
+      if (dx === 0 && dy === 0) return;
+
+      event.preventDefault();
+      setCandidates((prev) =>
+        prev.map((c) => {
+          if (c.id !== selectedCandidate.id) return c;
+          let nextX = c.bbox.x + dx;
+          let nextY = c.bbox.y + dy;
+          if (imageSize) {
+            nextX = Math.min(imageSize.w - c.bbox.w, Math.max(0, nextX));
+            nextY = Math.min(imageSize.h - c.bbox.h, Math.max(0, nextY));
+          }
+          return {
+            ...c,
+            bbox: { ...c.bbox, x: nextX, y: nextY },
+          };
+        })
+      );
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [selectedCandidate, segEditMode, imageSize]);
 
   useEffect(() => {
     let mounted = true;
@@ -63,6 +125,17 @@ export default function App() {
         if (!mounted) return;
         setError(err instanceof Error ? err.message : "Projects fetch failed");
       });
+    fetchTemplates()
+      .then((list) => {
+        if (!mounted) return;
+        const selected = list.find((p) => p.name === project) || list[0];
+        const classes = selected ? selected.classes.map((c) => c.class_name) : [];
+        setClassOptions(classes);
+      })
+      .catch((err) => {
+        if (!mounted) return;
+        setError(err instanceof Error ? err.message : "Templates fetch failed");
+      });
     return () => {
       mounted = false;
     };
@@ -77,6 +150,7 @@ export default function App() {
       const res = await uploadImage(file);
       setImageId(res.image_id);
       setImageUrl(URL.createObjectURL(file));
+      setImageSize({ w: res.width, h: res.height });
       setCandidates([]);
       setSelectedCandidateId(null);
     } catch (err) {
@@ -87,6 +161,8 @@ export default function App() {
   };
 
   const handleClickPoint = async (x: number, y: number) => {
+    if (isCreatingManualBBox) return;
+    if (manualClassMissing) return;
     if (!imageId || !project) return;
     setError(null);
     setNotice(null);
@@ -125,8 +201,21 @@ export default function App() {
 
   const handleConfirmCandidate = () => {
     if (!selectedCandidate) return;
+    if (selectedCandidate.source === "manual" && !selectedCandidate.class_name) {
+      setError("手動候補はクラスを選択してください");
+      return;
+    }
     const createdAt = new Date().toISOString();
-    const source = selectedCandidate.segPolygon ? "sam" : "template";
+    const source =
+      selectedCandidate.source === "manual"
+        ? "manual"
+        : selectedCandidate.segPolygon
+          ? "sam"
+          : "template";
+    const segPolygon = selectedCandidate.segPolygon
+      ? selectedCandidate.segPolygon.map((p) => ({ ...p }))
+      : undefined;
+    const segMethod = selectedCandidate.segMethod;
     setAnnotations((prev) => [
       ...prev,
       {
@@ -135,7 +224,9 @@ export default function App() {
         bbox: selectedCandidate.bbox,
         source,
         created_at: createdAt,
-        segPolygon: selectedCandidate.segPolygon,
+        segPolygon,
+        originalSegPolygon: segPolygon ? segPolygon.map((p) => ({ ...p })) : undefined,
+        segMethod,
       },
     ]);
     setNotice(`${selectedCandidate.class_name} を確定しました`);
@@ -185,9 +276,16 @@ export default function App() {
         setError(res.error || "Segmentation failed");
         return;
       }
+      let nextPolygon = res.polygon;
+      if (imageSize) {
+        nextPolygon = clampToImage(nextPolygon, imageSize.w, imageSize.h);
+      }
+      nextPolygon = simplifyPolygon(nextPolygon, segSimplifyEps);
       setCandidates((prev) =>
         prev.map((c) =>
-          c.id === selectedCandidate.id ? { ...c, segPolygon: res.polygon } : c
+          c.id === selectedCandidate.id
+            ? { ...c, segPolygon: nextPolygon, segMethod: res.meta?.method }
+            : c
         )
       );
       setNotice(`${selectedCandidate.class_name} のSegを生成しました`);
@@ -228,9 +326,45 @@ export default function App() {
 
   const handleSelectAnnotation = (annotation: Annotation) => {
     setSelectedAnnotationId(annotation.id);
+    setSegEditMode(false);
+    setSelectedVertexIndex(null);
+    setSegUndoStack([]);
+    setShowSegVertices(true);
     const centerX = annotation.bbox.x + annotation.bbox.w / 2;
     const centerY = annotation.bbox.y + annotation.bbox.h / 2;
     canvasRef.current?.panTo(centerX, centerY);
+  };
+
+  const handleSegUndo = () => {
+    if (segUndoStack.length === 0 || !selectedAnnotation) return;
+    const last = segUndoStack[segUndoStack.length - 1];
+    setSegUndoStack((prev) => prev.slice(0, -1));
+    setAnnotations((prev) =>
+      prev.map((a) =>
+        a.id === selectedAnnotation.id ? { ...a, segPolygon: last.map((p) => ({ ...p })) } : a
+      )
+    );
+  };
+
+  const handleSegReset = () => {
+    if (!selectedAnnotation?.originalSegPolygon) return;
+    const reset = selectedAnnotation.originalSegPolygon.map((p) => ({ ...p }));
+    setSegUndoStack([]);
+    setAnnotations((prev) =>
+      prev.map((a) => (a.id === selectedAnnotation.id ? { ...a, segPolygon: reset } : a))
+    );
+  };
+
+  const applySegSimplify = () => {
+    if (!selectedAnnotation?.segPolygon) return;
+    let next = selectedAnnotation.segPolygon;
+    if (imageSize) {
+      next = clampToImage(next, imageSize.w, imageSize.h);
+    }
+    next = simplifyPolygon(next, segSimplifyEps);
+    setAnnotations((prev) =>
+      prev.map((a) => (a.id === selectedAnnotation.id ? { ...a, segPolygon: next } : a))
+    );
   };
 
   return (
@@ -341,7 +475,46 @@ export default function App() {
             colorMap={colorMap}
             showCandidates={showCandidates}
             showAnnotations={showAnnotations}
+            editablePolygon={segEditMode ? selectedAnnotation?.segPolygon || null : null}
+            editMode={segEditMode}
+            showVertices={showSegVertices}
+            selectedVertexIndex={selectedVertexIndex}
+            onSelectVertex={setSelectedVertexIndex}
+            onUpdateEditablePolygon={(next) => {
+              if (!selectedAnnotation) return;
+              setAnnotations((prev) =>
+                prev.map((a) => (a.id === selectedAnnotation.id ? { ...a, segPolygon: next } : a))
+              );
+            }}
+            onVertexDragStart={() => {
+              if (!selectedAnnotation?.segPolygon) return;
+              setSegUndoStack((prev) => [
+                ...prev,
+                selectedAnnotation.segPolygon!.map((p) => ({ ...p })),
+              ]);
+            }}
             onClickPoint={handleClickPoint}
+            onCreateManualBBox={(bbox) => {
+              const id = `${Date.now()}-${Math.random()}`;
+              const manualCandidate: Candidate = {
+                id,
+                class_name: "",
+                score: 1.0,
+                bbox,
+                template: "manual",
+                scale: 1.0,
+                source: "manual",
+              };
+              setCandidates((prev) => [...prev, manualCandidate]);
+              setSelectedCandidateId(id);
+            }}
+            onManualCreateStateChange={setIsCreatingManualBBox}
+            onResizeSelectedBBox={(bbox) => {
+              if (!selectedCandidateId) return;
+              setCandidates((prev) =>
+                prev.map((c) => (c.id === selectedCandidateId ? { ...c, bbox } : c))
+              );
+            }}
           />
           {busy && <div style={{ marginTop: 10, color: "#666" }}>処理中...</div>}
         </div>
@@ -376,7 +549,7 @@ export default function App() {
               <button
                 type="button"
                 onClick={handleConfirmCandidate}
-                disabled={!selectedCandidate}
+                disabled={!selectedCandidate || manualClassMissing}
                 style={{ padding: "8px 10px", fontSize: 12, cursor: "pointer" }}
               >
                 ✔ この候補を確定
@@ -406,6 +579,38 @@ export default function App() {
                 🧩 Seg生成（SAM）
               </button>
             </div>
+            {isManualSelected && (
+              <div style={{ marginTop: 10 }}>
+                <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <span style={{ fontSize: 12, minWidth: 60 }}>クラス選択</span>
+                  <select
+                    value={selectedCandidate?.class_name || ""}
+                    onChange={(e) => {
+                      const nextClass = e.target.value;
+                      setCandidates((prev) =>
+                        prev.map((c) =>
+                          c.id === selectedCandidate?.id ? { ...c, class_name: nextClass } : c
+                        )
+                      );
+                      if (nextClass) {
+                        setColorMap((prev) => {
+                          if (prev[nextClass]) return prev;
+                          return { ...prev, [nextClass]: normalizeToHex(randomColor(nextClass)) };
+                        });
+                      }
+                    }}
+                    style={{ minWidth: 160 }}
+                  >
+                    <option value="">クラスを選択</option>
+                    {classOptions.map((name) => (
+                      <option key={name} value={name}>
+                        {name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+            )}
           </div>
 
           <div style={{ marginBottom: 18 }}>
@@ -445,7 +650,22 @@ export default function App() {
                 onClick={() => handleSelectAnnotation(a)}
               >
                 <div>
-                  <div style={{ fontWeight: 600 }}>{a.class_name}</div>
+                  <div style={{ fontWeight: 600, display: "flex", alignItems: "center", gap: 6 }}>
+                    <span>{a.class_name}</span>
+                    {a.segPolygon && a.segMethod && (
+                      <span
+                        style={{
+                          fontSize: 10,
+                          padding: "2px 6px",
+                          borderRadius: 10,
+                          background: a.segMethod === "sam" ? "#2e7d32" : "#888",
+                          color: "#fff",
+                        }}
+                      >
+                        {a.segMethod.toUpperCase()}
+                      </span>
+                    )}
+                  </div>
                   <div style={{ fontSize: 12, color: "#666" }}>
                     bbox: ({a.bbox.x}, {a.bbox.y}, {a.bbox.w}, {a.bbox.h})
                   </div>
@@ -472,6 +692,66 @@ export default function App() {
               </div>
             ))}
           </div>
+
+          {selectedAnnotation?.segPolygon && (
+            <div style={{ marginBottom: 18 }}>
+              <div style={{ fontWeight: 600, marginBottom: 8 }}>Seg編集</div>
+              <label style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
+                <input
+                  type="checkbox"
+                  checked={segEditMode}
+                  onChange={(e) => {
+                    const next = e.target.checked;
+                    if (!next && segEditMode) {
+                      applySegSimplify();
+                    }
+                    setSegEditMode(next);
+                  }}
+                />
+                <span style={{ fontSize: 12 }}>編集モードON/OFF</span>
+              </label>
+              <label style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 8 }}>
+                <input
+                  type="checkbox"
+                  checked={showSegVertices}
+                  onChange={(e) => setShowSegVertices(e.target.checked)}
+                  disabled={!segEditMode}
+                />
+                <span style={{ fontSize: 12 }}>頂点を表示</span>
+              </label>
+              <label style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+                <span style={{ fontSize: 12, minWidth: 70 }}>簡略化</span>
+                <input
+                  type="range"
+                  min={1}
+                  max={10}
+                  step={1}
+                  value={segSimplifyEps}
+                  onChange={(e) => setSegSimplifyEps(Number(e.target.value))}
+                  disabled={!segEditMode}
+                />
+                <span style={{ fontSize: 12 }}>{segSimplifyEps}</span>
+              </label>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button
+                  type="button"
+                  onClick={handleSegUndo}
+                  disabled={!segEditMode || segUndoStack.length === 0}
+                  style={{ padding: "6px 10px", fontSize: 12, cursor: "pointer" }}
+                >
+                  Undo
+                </button>
+                <button
+                  type="button"
+                  onClick={handleSegReset}
+                  disabled={!segEditMode || !selectedAnnotation.originalSegPolygon}
+                  style={{ padding: "6px 10px", fontSize: 12, cursor: "pointer" }}
+                >
+                  Reset
+                </button>
+              </div>
+            </div>
+          )}
 
           <div style={{ marginBottom: 18 }}>
             <button
