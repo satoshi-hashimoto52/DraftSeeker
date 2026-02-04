@@ -13,3 +13,6 @@ DEFAULT_SCALE_MIN = 0.5
 DEFAULT_SCALE_MAX = 1.5
 DEFAULT_SCALE_STEPS = 12
 DEFAULT_TOPK = 3
+
+SAM_CHECKPOINT = "/Users/hashimoto/vscode/_project/draft_seeker/models/sam_vit_l_0b3195.pth"
+SAM_MODEL_TYPE = "vit_l"

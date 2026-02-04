@@ -51,6 +51,17 @@ cd /Users/hashimoto/vscode/_project/draft_seeker/frontend
 npm run dev -- --host 127.0.0.1 --port 5173
 ```
 
+## SAMセットアップメモ
+
+SAMを使う場合は、`backend/requirements.txt` に加えて以下をインストールしてください。
+
+```bash
+pip install torch torchvision segment-anything
+```
+
+チェックポイントは `SAM_CHECKPOINT` 環境変数、または `backend/app/config.py` の
+`SAM_CHECKPOINT` を指定してください。
+
 ## 動作確認
 
 1. `http://127.0.0.1:8000/projects` でプロジェクト一覧を取得

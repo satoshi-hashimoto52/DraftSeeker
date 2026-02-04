@@ -1,8 +1,18 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 
-import { detectPoint, uploadImage, fetchProjects, DetectResult } from "./api";
-import ImageCanvas from "./components/ImageCanvas";
+import {
+  Annotation,
+  Candidate,
+  detectPoint,
+  exportYolo,
+  fetchProjects,
+  segmentCandidate,
+  toCandidates,
+  uploadImage,
+} from "./api";
+import ImageCanvas, { ImageCanvasHandle } from "./components/ImageCanvas";
 import CandidateList from "./components/CandidateList";
+import { normalizeToHex } from "./utils/color";
 
 const DEFAULT_ROI_SIZE = 200;
 const DEFAULT_TOPK = 3;
@@ -20,25 +30,24 @@ export default function App() {
   const [scaleMin, setScaleMin] = useState<number>(DEFAULT_SCALE_MIN);
   const [scaleMax, setScaleMax] = useState<number>(DEFAULT_SCALE_MAX);
   const [scaleSteps, setScaleSteps] = useState<number>(DEFAULT_SCALE_STEPS);
-  const [candidates, setCandidates] = useState<DetectResult[]>([]);
-  const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
+  const [candidates, setCandidates] = useState<Candidate[]>([]);
+  const [selectedCandidateId, setSelectedCandidateId] = useState<string | null>(null);
+  const [annotations, setAnnotations] = useState<Annotation[]>([]);
+  const [selectedAnnotationId, setSelectedAnnotationId] = useState<string | null>(null);
   const [colorMap, setColorMap] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [showCandidates, setShowCandidates] = useState<boolean>(true);
+  const [showAnnotations, setShowAnnotations] = useState<boolean>(true);
+  const canvasRef = useRef<ImageCanvasHandle | null>(null);
+  const [lastClick, setLastClick] = useState<{ x: number; y: number } | null>(null);
+  const [exportPreview, setExportPreview] = useState<string | null>(null);
 
-  const bestBBox = useMemo(() => {
-    if (!candidates.length) return null;
-    const index = selectedIndex ?? 0;
-    if (index < 0 || index >= candidates.length) return candidates[0].bbox;
-    return candidates[index].bbox;
-  }, [candidates, selectedIndex]);
-
-  const activeColor = useMemo(() => {
-    if (!candidates.length) return "#ff2b2b";
-    const index = selectedIndex ?? 0;
-    const target = candidates[index] || candidates[0];
-    return colorMap[target.class_name] || "#ff2b2b";
-  }, [candidates, selectedIndex, colorMap]);
+  const selectedCandidate = useMemo(() => {
+    if (!selectedCandidateId) return null;
+    return candidates.find((c) => c.id === selectedCandidateId) || null;
+  }, [candidates, selectedCandidateId]);
 
   useEffect(() => {
     let mounted = true;
@@ -69,6 +78,7 @@ export default function App() {
       setImageId(res.image_id);
       setImageUrl(URL.createObjectURL(file));
       setCandidates([]);
+      setSelectedCandidateId(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Upload failed");
     } finally {
@@ -79,7 +89,9 @@ export default function App() {
   const handleClickPoint = async (x: number, y: number) => {
     if (!imageId || !project) return;
     setError(null);
+    setNotice(null);
     setBusy(true);
+    setLastClick({ x, y });
     try {
       const res = await detectPoint({
         image_id: imageId,
@@ -92,13 +104,14 @@ export default function App() {
         scale_steps: scaleSteps,
         topk,
       });
-      setCandidates(res.results || []);
-      setSelectedIndex(res.results && res.results.length > 0 ? 0 : null);
+      const nextCandidates = toCandidates(res);
+      setCandidates(nextCandidates);
+      setSelectedCandidateId(nextCandidates.length > 0 ? nextCandidates[0].id : null);
       setColorMap((prev) => {
         const next = { ...prev };
-        (res.results || []).forEach((r) => {
+        nextCandidates.forEach((r) => {
           if (!next[r.class_name]) {
-            next[r.class_name] = randomColor(r.class_name);
+            next[r.class_name] = normalizeToHex(randomColor(r.class_name));
           }
         });
         return next;
@@ -108,6 +121,116 @@ export default function App() {
     } finally {
       setBusy(false);
     }
+  };
+
+  const handleConfirmCandidate = () => {
+    if (!selectedCandidate) return;
+    const createdAt = new Date().toISOString();
+    const source = selectedCandidate.segPolygon ? "sam" : "template";
+    setAnnotations((prev) => [
+      ...prev,
+      {
+        id: `${Date.now()}-${Math.random()}`,
+        class_name: selectedCandidate.class_name,
+        bbox: selectedCandidate.bbox,
+        source,
+        created_at: createdAt,
+        segPolygon: selectedCandidate.segPolygon,
+      },
+    ]);
+    setNotice(`${selectedCandidate.class_name} を確定しました`);
+    if (candidates.length > 0) {
+      const index = candidates.findIndex((c) => c.id === selectedCandidate.id);
+      if (index >= 0) {
+        const nextIndex = (index + 1) % candidates.length;
+        setSelectedCandidateId(candidates[nextIndex].id);
+      }
+    }
+  };
+
+  const handleRejectCandidate = () => {
+    if (!selectedCandidate) return;
+    const index = candidates.findIndex((c) => c.id === selectedCandidate.id);
+    const next = candidates.filter((c) => c.id !== selectedCandidate.id);
+    setCandidates(next);
+    if (next.length === 0) {
+      setSelectedCandidateId(null);
+      return;
+    }
+    const nextIndex = index < next.length ? index : next.length - 1;
+    setSelectedCandidateId(next[nextIndex].id);
+  };
+
+  const handleNextCandidate = () => {
+    if (candidates.length === 0) return;
+    const index = selectedCandidateId
+      ? candidates.findIndex((c) => c.id === selectedCandidateId)
+      : -1;
+    const nextIndex = index >= 0 ? (index + 1) % candidates.length : 0;
+    setSelectedCandidateId(candidates[nextIndex].id);
+  };
+
+  const handleSegCandidate = async () => {
+    if (!selectedCandidate || !imageId) return;
+    setError(null);
+    setNotice(null);
+    setBusy(true);
+    try {
+      const res = await segmentCandidate({
+        image_id: imageId,
+        bbox: selectedCandidate.bbox,
+        click: lastClick,
+      });
+      if (!res.ok || !res.polygon) {
+        setError(res.error || "Segmentation failed");
+        return;
+      }
+      setCandidates((prev) =>
+        prev.map((c) =>
+          c.id === selectedCandidate.id ? { ...c, segPolygon: res.polygon } : c
+        )
+      );
+      setNotice(`${selectedCandidate.class_name} のSegを生成しました`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Segmentation failed");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleExportYolo = async () => {
+    if (!imageId || !project) return;
+    setError(null);
+    setNotice(null);
+    setBusy(true);
+    try {
+      const res = await exportYolo({
+        project,
+        image_id: imageId,
+        annotations: annotations.map((a) => ({
+          class_name: a.class_name,
+          bbox: a.bbox,
+          segPolygon: a.segPolygon,
+        })),
+      });
+      if (!res.ok) {
+        setError(res.error || "Export failed");
+        return;
+      }
+      setExportPreview(res.text_preview || "");
+      setNotice(`Exported: ${res.saved_path || ""}`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Export failed");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleSelectAnnotation = (annotation: Annotation) => {
+    setSelectedAnnotationId(annotation.id);
+    const centerX = annotation.bbox.x + annotation.bbox.w / 2;
+    const centerY = annotation.bbox.y + annotation.bbox.h / 2;
+    canvasRef.current?.panTo(centerX, centerY);
   };
 
   return (
@@ -204,41 +327,198 @@ export default function App() {
           {error && (
             <div style={{ marginBottom: 12, color: "#b00020" }}>Error: {error}</div>
           )}
+          {notice && (
+            <div style={{ marginBottom: 12, color: "#1b5e20", fontSize: 12 }}>{notice}</div>
+          )}
 
           <ImageCanvas
+            ref={canvasRef}
             imageUrl={imageUrl}
-            bbox={bestBBox}
-            bboxColor={activeColor}
+            candidates={candidates}
+            selectedCandidateId={selectedCandidateId}
+            annotations={annotations}
+            selectedAnnotationId={selectedAnnotationId}
+            colorMap={colorMap}
+            showCandidates={showCandidates}
+            showAnnotations={showAnnotations}
             onClickPoint={handleClickPoint}
           />
           {busy && <div style={{ marginTop: 10, color: "#666" }}>処理中...</div>}
         </div>
 
         <div style={{ borderLeft: "1px solid #eee", paddingLeft: 16 }}>
-          <CandidateList
-            candidates={candidates}
-            selectedIndex={selectedIndex}
-            onSelect={setSelectedIndex}
-            colorMap={colorMap}
-          />
+          <div style={{ marginBottom: 12 }}>
+            <label style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
+              <input
+                type="checkbox"
+                checked={showCandidates}
+                onChange={(e) => setShowCandidates(e.target.checked)}
+              />
+              <span style={{ fontSize: 12 }}>未確定候補を表示</span>
+            </label>
+            <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <input
+                type="checkbox"
+                checked={showAnnotations}
+                onChange={(e) => setShowAnnotations(e.target.checked)}
+              />
+              <span style={{ fontSize: 12 }}>確定アノテーションを表示</span>
+            </label>
+          </div>
+          <div style={{ marginBottom: 18 }}>
+            <CandidateList
+              candidates={candidates}
+              selectedCandidateId={selectedCandidateId}
+              onSelect={setSelectedCandidateId}
+              colorMap={colorMap}
+            />
+            <div style={{ marginTop: 12, display: "flex", gap: 8 }}>
+              <button
+                type="button"
+                onClick={handleConfirmCandidate}
+                disabled={!selectedCandidate}
+                style={{ padding: "8px 10px", fontSize: 12, cursor: "pointer" }}
+              >
+                ✔ この候補を確定
+              </button>
+              <button
+                type="button"
+                onClick={handleRejectCandidate}
+                disabled={!selectedCandidate}
+                style={{ padding: "8px 10px", fontSize: 12, cursor: "pointer" }}
+              >
+                ✖ 破棄（候補から除外）
+              </button>
+              <button
+                type="button"
+                onClick={handleNextCandidate}
+                disabled={candidates.length === 0}
+                style={{ padding: "8px 10px", fontSize: 12, cursor: "pointer" }}
+              >
+                ▶ 次の候補へ
+              </button>
+              <button
+                type="button"
+                onClick={handleSegCandidate}
+                disabled={!selectedCandidate}
+                style={{ padding: "8px 10px", fontSize: 12, cursor: "pointer" }}
+              >
+                🧩 Seg生成（SAM）
+              </button>
+            </div>
+          </div>
+
+          <div style={{ marginBottom: 18 }}>
+            <div style={{ fontWeight: 600, marginBottom: 4 }}>
+              確定アノテーション（合計 {annotations.length}件）
+            </div>
+            <div style={{ fontSize: 12, color: "#666", marginBottom: 8 }}>
+              {annotations.length === 0
+                ? "内訳: なし"
+                : Object.entries(
+                    annotations.reduce<Record<string, number>>((acc, a) => {
+                      acc[a.class_name] = (acc[a.class_name] || 0) + 1;
+                      return acc;
+                    }, {})
+                  )
+                    .map(([name, count]) => `${name}: ${count}`)
+                    .join(" / ")}
+            </div>
+            {annotations.length === 0 && (
+              <div style={{ color: "#666" }}>確定アノテはまだありません。</div>
+            )}
+            {annotations.map((a) => (
+              <div
+                key={a.id}
+                style={{
+                  padding: "8px 10px",
+                  marginBottom: 8,
+                  border: "1px solid #e3e3e3",
+                  borderRadius: 6,
+                  background: selectedAnnotationId === a.id ? "#eef6ff" : "#fff",
+                  cursor: "pointer",
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  gap: 8,
+                }}
+                onClick={() => handleSelectAnnotation(a)}
+              >
+                <div>
+                  <div style={{ fontWeight: 600 }}>{a.class_name}</div>
+                  <div style={{ fontSize: 12, color: "#666" }}>
+                    bbox: ({a.bbox.x}, {a.bbox.y}, {a.bbox.w}, {a.bbox.h})
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  aria-label="delete"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setAnnotations((prev) => prev.filter((item) => item.id !== a.id));
+                    if (selectedAnnotationId === a.id) {
+                      setSelectedAnnotationId(null);
+                    }
+                  }}
+                  style={{
+                    border: "none",
+                    background: "transparent",
+                    cursor: "pointer",
+                    fontSize: 16,
+                  }}
+                >
+                  🗑
+                </button>
+              </div>
+            ))}
+          </div>
+
+          <div style={{ marginBottom: 18 }}>
+            <button
+              type="button"
+              onClick={handleExportYolo}
+              disabled={annotations.length === 0 || !imageId}
+              style={{ padding: "8px 10px", fontSize: 12, cursor: "pointer" }}
+            >
+              ⤴ YOLOエクスポート
+            </button>
+            {exportPreview !== null && (
+              <pre
+                style={{
+                  marginTop: 8,
+                  padding: 8,
+                  background: "#f6f6f6",
+                  border: "1px solid #e3e3e3",
+                  borderRadius: 6,
+                  fontSize: 12,
+                  whiteSpace: "pre-wrap",
+                }}
+              >
+                {exportPreview}
+              </pre>
+            )}
+          </div>
           {Object.keys(colorMap).length > 0 && (
             <div style={{ marginTop: 16 }}>
               <div style={{ fontWeight: 600, marginBottom: 8 }}>シリーズ配色</div>
-              {Object.entries(colorMap).map(([name, color]) => (
+              {Object.entries(colorMap).map(([name, color]) => {
+                const hexColor = normalizeToHex(color);
+                return (
                 <div
                   key={name}
                   style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}
                 >
                   <input
                     type="color"
-                    value={color}
+                    value={hexColor}
                     onChange={(e) =>
                       setColorMap((prev) => ({ ...prev, [name]: e.target.value }))
                     }
                   />
                   <span style={{ fontSize: 12 }}>{name}</span>
                 </div>
-              ))}
+                );
+              })}
             </div>
           )}
         </div>

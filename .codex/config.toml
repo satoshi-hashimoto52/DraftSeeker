@@ -1,0 +1,18 @@
+# ~/.codex/config.toml
+
+[auth]
+method = "browser"
+
+[model]
+default = "gpt-5-codex"
+
+[ui]
+auto_confirm = false
+verbosity = "normal"
+
+[execution]
+allow_shell = false
+timeout_seconds = 300
+
+[filesystem]
+respect_gitignore = true

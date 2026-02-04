@@ -57,7 +57,6 @@ def match_templates(
     y: int,
     roi_size: int,
     templates: Dict[str, List[TemplateImage]],
-    topk: int,
     scale_min: float,
     scale_max: float,
     scale_steps: int,
@@ -72,10 +71,6 @@ def match_templates(
     results: List[MatchResult] = []
 
     for class_name, template_list in templates.items():
-        best_score = None
-        best_bbox = None
-        best_template_name = None
-        best_scale = None
         for tpl in template_list:
             for scale, scaled in _iter_scaled_templates(
                 tpl.image_gray, scale_min, scale_max, scale_steps
@@ -85,29 +80,17 @@ def match_templates(
                     continue
                 res = cv2.matchTemplate(roi, scaled, cv2.TM_CCOEFF_NORMED)
                 _min_val, max_val, _min_loc, max_loc = cv2.minMaxLoc(res)
-                if best_score is None or max_val > best_score:
-                    best_score = float(max_val)
-                    bx = x0 + max_loc[0]
-                    by = y0 + max_loc[1]
-                    best_bbox = (bx, by, tw, th)
-                    best_template_name = tpl.template_name
-                    best_scale = scale
-
-        if (
-            best_score is not None
-            and best_bbox is not None
-            and best_template_name is not None
-            and best_scale is not None
-        ):
-            results.append(
-                MatchResult(
-                    class_name=class_name,
-                    template_name=best_template_name,
-                    score=best_score,
-                    scale=best_scale,
-                    bbox=best_bbox,
+                bx = x0 + max_loc[0]
+                by = y0 + max_loc[1]
+                results.append(
+                    MatchResult(
+                        class_name=class_name,
+                        template_name=tpl.template_name,
+                        score=float(max_val),
+                        scale=scale,
+                        bbox=(bx, by, tw, th),
+                    )
                 )
-            )
 
     results.sort(key=lambda r: r.score, reverse=True)
-    return results[:topk]
+    return results
