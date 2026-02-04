@@ -1,41 +1,50 @@
-# Draft Seeker Annotator (MVP Step1)
+# Draft Seeker Annotator
 
-図面アノテ支援WebアプリのMVP Step1です。図面を表示し、クリック点周辺ROIでテンプレ照合し、候補BBoxを返します。
+CAD 図面画像向けのアノテーション支援 Web アプリです。  
+OpenCV のテンプレートマッチと SAM（必要時のみ）＋フォールバック輪郭抽出を組み合わせ、  
+候補生成から YOLO / YOLO-seg 出力までを一通りサポートします。
 
-## 構成
+## できること
 
-- `backend/` FastAPI
-- `frontend/` React + Vite
-- `data/` 画像とテンプレ
+- クリック点ベースのテンプレ照合（ROI）
+- マルチスケール対応
+- クラス別 NMS / TopK 候補
+- 候補の確定 / 破棄などの手動修正 UI
+- SAM によるセグメンテーション（オンデマンド）
+- SAM不使用時のフォールバック（輪郭抽出）
+- YOLO / YOLO-seg エクスポート
 
-## ディレクトリ構造
+## ディレクトリ構成
 
 ```
-DraftSeeker/
-  .venv/
-  backend/
-  data/
-    images/
-    runs/
-    templates_root/
-  frontend/
+draft_seeker/
+  backend/   FastAPI (API・推論)
+  frontend/  React + Vite (UI)
+  data/      画像・テンプレ・出力
+  docs/      ドキュメント
 ```
 
-## テンプレ配置
+### テンプレ配置
 
-`templates_root` は2階層構成です。1階層目がプロジェクト名、2階層目がクラス名になります。
+`data/templates_root` は2階層構成です。1階層目がプロジェクト名、2階層目がクラス名です。
 
 ```
 data/templates_root/
   project_a/
-    図形1/
+    roof_fan/
       0.jpeg
       1.jpeg
-    図形2/
+    door_w/
       0.jpeg
 ```
 
-## 起動
+## 動作環境
+
+- Backend: FastAPI (Python)
+- Frontend: React + Vite
+- SAM: CPU / Apple MPS（macOS M1 想定）
+
+## 起動手順
 
 バックエンド:
 
@@ -51,28 +60,26 @@ cd /Users/hashimoto/vscode/_project/draft_seeker/frontend
 npm run dev -- --host 127.0.0.1 --port 5173
 ```
 
-## SAMセットアップメモ
-
-SAMを使う場合は、`backend/requirements.txt` に加えて以下をインストールしてください。
+## SAM セットアップ
 
 ```bash
 pip install torch torchvision segment-anything
 ```
 
 チェックポイントは `SAM_CHECKPOINT` 環境変数、または `backend/app/config.py` の
-`SAM_CHECKPOINT` を指定してください。
+`SAM_CHECKPOINT` で指定します。
 
-## 動作確認
+## エクスポート仕様（YOLO / YOLO-seg）
 
-1. `http://127.0.0.1:8000/projects` でプロジェクト一覧を取得
-2. フロントで画像アップロード
-3. 画像クリックで候補TopKとBBoxを確認
+- 1画像 = 1 txt
+- `segPolygon` があれば YOLO-seg（`class_id x1 y1 x2 y2 ...`）
+- `segPolygon` が無ければ YOLO bbox（`class_id cx cy w h`）
+- 全座標は 0〜1 正規化
+- class_id は `data/runs/<project>/classes.json` に保存・固定
 
-## API概要
+## 注意事項
 
-- `GET /projects` プロジェクト一覧
-- `GET /templates` プロジェクト配下クラス一覧
-- `POST /image/upload` 画像アップロード
-- `POST /detect/point` クリック検出
+- SAM は常時 ON にせず、必要時のみ実行する設計です
+- 図面特有の注記・寸法文字は対象外（テンプレから外す前提）
 
-詳細は `docs/api.md` を参照してください。
+詳細な API は `docs/api.md` を参照してください。

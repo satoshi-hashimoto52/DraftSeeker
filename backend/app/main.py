@@ -7,6 +7,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 import numpy as np
+import json
 from pathlib import Path
 
 from .config import (
@@ -405,6 +406,8 @@ def export_yolo(payload: ExportYoloRequest) -> ExportYoloResponse:
 
     project_dir = RUNS_DIR / payload.project
     project_dir.mkdir(parents=True, exist_ok=True)
+    classes_path = project_dir / "classes.json"
+    classes_path.write_text(json.dumps(class_to_id, ensure_ascii=False, indent=2), encoding="utf-8")
     output_path = project_dir / f"{payload.image_id}.txt"
     output_path.write_text("\n".join(lines), encoding="utf-8")
 
