@@ -13,6 +13,7 @@ import numpy as np
 import json
 from pathlib import Path
 from uuid import uuid4
+import io
 import shutil
 from datetime import datetime
 import random
@@ -62,7 +63,7 @@ from .schemas import (
     TemplateInfo,
     UploadResponse,
 )
-from .storage import IMAGE_EXTS, RUNS_DIR, resolve_image_path, save_upload
+from .storage import IMAGE_EXTS, RUNS_DIR, resolve_image_path
 from .templates import scan_templates
 from .sam_service import get_sam_predictor
 from .sam_device import get_sam_device
@@ -72,6 +73,10 @@ from .export_yolo import normalize_bbox
 
 
 app = FastAPI(title="Annotator MVP")
+
+DATASET_IMAGE_PREFIX = "dataset::"
+MEMORY_IMAGE_PREFIX = "mem::"
+IN_MEMORY_IMAGES: Dict[str, bytes] = {}
 
 app.add_middleware(
     CORSMiddleware,
@@ -175,6 +180,51 @@ def _project_annotations_dir(project_name: str) -> Path:
 
 def _project_meta_path(project_name: str) -> Path:
     return _project_dir(project_name) / "meta.json"
+
+
+def _resolve_any_image_path(image_id: str) -> Path:
+    if image_id.startswith(DATASET_IMAGE_PREFIX):
+        rest = image_id[len(DATASET_IMAGE_PREFIX) :]
+        if "::" not in rest:
+            raise FileNotFoundError(image_id)
+        project_name, filename = rest.split("::", 1)
+        safe_name = Path(filename).name
+        return _project_images_dir(project_name) / safe_name
+    return resolve_image_path(IMAGES_DIR, image_id)
+
+
+def _read_image_bgr(image_id: str) -> np.ndarray:
+    if image_id.startswith(MEMORY_IMAGE_PREFIX):
+        data = IN_MEMORY_IMAGES.get(image_id)
+        if not data:
+            raise FileNotFoundError(image_id)
+        arr = np.frombuffer(data, np.uint8)
+        image = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if image is None:
+            raise ValueError("failed to read image")
+        return image
+    image_path = _resolve_any_image_path(image_id)
+    image = cv2.imread(str(image_path))
+    if image is None:
+        raise ValueError("failed to read image")
+    return image
+
+
+def _save_upload_memory(image_file: UploadFile) -> UploadResponse:
+    suffix = Path(image_file.filename or "").suffix.lower()
+    if suffix not in IMAGE_EXTS:
+        raise ValueError("unsupported file type")
+    data = image_file.file.read()
+    if not data:
+        raise ValueError("empty file")
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            width, height = img.size
+    except Exception as exc:
+        raise ValueError("invalid image") from exc
+    image_id = f"{MEMORY_IMAGE_PREFIX}{uuid4().hex}{suffix}"
+    IN_MEMORY_IMAGES[image_id] = data
+    return UploadResponse(image_id=image_id, width=width, height=height)
 
 
 def _parse_internal_id(value: object, fallback: int) -> int:
@@ -509,11 +559,7 @@ def select_dataset_image(payload: DatasetSelectRequest) -> UploadResponse:
             width, height = img.size
     except Exception as exc:
         raise HTTPException(status_code=400, detail="invalid image") from exc
-    suffix = image_path.suffix.lower()
-    image_id = f"{uuid4().hex}{suffix}"
-    IMAGES_DIR.mkdir(parents=True, exist_ok=True)
-    dest = IMAGES_DIR / image_id
-    dest.write_bytes(image_path.read_bytes())
+    image_id = f"{DATASET_IMAGE_PREFIX}{project_name}::{safe_name}"
     return UploadResponse(image_id=image_id, width=width, height=height, filename=safe_name)
 
 
@@ -868,21 +914,19 @@ def download_dataset_export(project_name: str, export_id: str) -> FileResponse:
 @app.post("/image/upload", response_model=UploadResponse)
 def upload_image(file: UploadFile = File(...)) -> UploadResponse:
     try:
-        image_id, width, height = save_upload(file, IMAGES_DIR)
+        result = _save_upload_memory(file)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    return UploadResponse(image_id=image_id, width=width, height=height)
+    return result
 
 
 @app.post("/detect/point", response_model=DetectPointResponse)
 def detect_point(payload: DetectPointRequest) -> DetectPointResponse:
     try:
-        image_path = resolve_image_path(IMAGES_DIR, payload.image_id)
+        image = _read_image_bgr(payload.image_id)
     except FileNotFoundError:
         raise HTTPException(status_code=400, detail="invalid image_id")
-
-    image = cv2.imread(str(image_path))
-    if image is None:
+    except ValueError:
         raise HTTPException(status_code=400, detail="failed to read image")
 
     if payload.template_off:
@@ -989,12 +1033,10 @@ def detect_point(payload: DetectPointRequest) -> DetectPointResponse:
 @app.post("/detect/full", response_model=DetectFullResponse)
 def detect_full(payload: DetectFullRequest) -> DetectFullResponse:
     try:
-        image_path = resolve_image_path(IMAGES_DIR, payload.image_id)
+        image = _read_image_bgr(payload.image_id)
     except FileNotFoundError:
         raise HTTPException(status_code=400, detail="invalid image_id")
-
-    image = cv2.imread(str(image_path))
-    if image is None:
+    except ValueError:
         raise HTTPException(status_code=400, detail="failed to read image")
 
     project_templates = templates_cache.get(payload.project)
@@ -1102,12 +1144,10 @@ def detect_full(payload: DetectFullRequest) -> DetectFullResponse:
 @app.post("/segment/candidate", response_model=SegmentCandidateResponse)
 def segment_candidate(payload: SegmentCandidateRequest) -> SegmentCandidateResponse:
     try:
-        image_path = resolve_image_path(IMAGES_DIR, payload.image_id)
+        image = _read_image_bgr(payload.image_id)
     except FileNotFoundError:
         return SegmentCandidateResponse(ok=False, error="invalid image_id")
-
-    image = cv2.imread(str(image_path))
-    if image is None:
+    except ValueError:
         return SegmentCandidateResponse(ok=False, error="failed to read image")
 
     height, width = image.shape[:2]
@@ -1219,18 +1259,17 @@ def segment_candidate(payload: SegmentCandidateRequest) -> SegmentCandidateRespo
 @app.post("/export/yolo", response_model=ExportYoloResponse)
 def export_yolo(payload: ExportYoloRequest) -> ExportYoloResponse:
     try:
-        image_path = resolve_image_path(IMAGES_DIR, payload.image_id)
+        image = _read_image_bgr(payload.image_id)
     except FileNotFoundError:
         return ExportYoloResponse(ok=False, error="invalid image_id")
+    except ValueError:
+        return ExportYoloResponse(ok=False, error="failed to read image")
 
     output_dir = Path(payload.output_dir).expanduser()
     if not output_dir.is_absolute():
         return ExportYoloResponse(ok=False, error="output_dir must be absolute")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    image = cv2.imread(str(image_path))
-    if image is None:
-        return ExportYoloResponse(ok=False, error="failed to read image")
     height, width = image.shape[:2]
 
     class_names = _get_project_class_names(payload.project)
